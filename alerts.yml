@@ -35,7 +35,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python live_alert_bot_ict.py \
-            --tickers MES=F,MNQ=F \
+            --tickers MES=F,MNQ=F,MYM=F \
             --once \
             --session-start 02:00 \
             --session-end 05:00 \
@@ -43,7 +43,7 @@ jobs:
             --telegram-token "$TELEGRAM_TOKEN" \
             --telegram-chat-id "$TELEGRAM_CHAT_ID"
           python live_alert_bot_ict.py \
-            --tickers MES=F,MNQ=F \
+            --tickers MES=F,MNQ=F,MYM=F \
             --once \
             --session-start 08:30 \
             --session-end 11:00 \
