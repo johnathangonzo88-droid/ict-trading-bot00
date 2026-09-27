@@ -1,20 +1,36 @@
 """
-Live Alert Bot — ICT Liquidity-Sweep Strategy
-================================================
-Same polling design as live_alert_bot.py, but wired to the ICT-concepts
-strategy (liquidity sweep -> market structure shift -> FVG retest) in
-ict_liquidity_strategy.py instead of the breakout-retest strategy.
+Live Alert Bot — ICT Liquidity-Sweep Strategy v2 (fixed + 24h + ES/NQ)
+=========================================================================
+Wired to ict_liquidity_strategy_v2.py instead of v1. Changes vs. the
+original live_alert_bot_ict.py, per the optimization study's findings:
 
-Requires ict_liquidity_strategy.py AND breakout_retest_strategy.py in the
-same folder (the ICT script reuses the breakout script's data loading and
-backtest helpers).
+  - Runs 24h by default (--session-start/--session-end default to None).
+    The study found the killzone-only filter left single-digit-to-teens
+    of trades over months of history -- not enough sample to validate.
+    You can still pass a session window if you want one; it's opt-in now.
+  - Defaults to the validated parameter family from the study
+    (liquidity_lookback=30, pivot=2, mss_window=20, retest_window=15,
+    rr_target=2.5) instead of v1's untested defaults.
+  - Defaults exit-mode to "liquidity" (wires up the real liquidity-pool
+    target instead of a blind fixed-R multiple) with a small ATR stop
+    buffer and a time-stop, per the study's code recommendations.
+  - Defaults --tickers to ES=F,NQ=F. NQ is where the study found a
+    broad, real edge; ES only became competitive once the liquidity-
+    target exit was wired in (see the backtest comparison in the repo /
+    project doc) and its out-of-sample result there is breakeven, not
+    clearly profitable -- treat ES alerts as a candidate for
+    paper-trading, not a validated signal, and size accordingly (or
+    drop it from --tickers if you'd rather run NQ-only until more ES
+    history is validated).
+  - The alert message now includes the stop and target prices, since v2
+    computes a real (buffered) stop and a real (liquidity-based) target
+    instead of nothing more than "here's a signal."
 
 Usage:
-  python live_alert_bot_ict.py --tickers MES=F,MNQ=F --once --dry-run
+  python live_alert_bot_ict_v2.py --tickers ES=F,NQ=F --once --dry-run
 
-  python live_alert_bot_ict.py --tickers MES=F,MNQ=F \
-      --telegram-token YOUR_BOT_TOKEN --telegram-chat-id YOUR_CHAT_ID \
-      --session-start 02:00 --session-end 05:00
+  python live_alert_bot_ict_v2.py --tickers ES=F,NQ=F \
+      --telegram-token YOUR_BOT_TOKEN --telegram-chat-id YOUR_CHAT_ID
 """
 
 import argparse
@@ -24,11 +40,10 @@ import time
 
 import pandas as pd
 
-from ict_liquidity_strategy import generate_signals
-from breakout_retest_strategy import load_yfinance, filter_session
+from ict_liquidity_strategy_v2 import generate_signals, backtest, load_yfinance, filter_session
 
 
-STATE_FILE_DEFAULT = "ict_alert_state.json"
+STATE_FILE_DEFAULT = "ict_alert_state_v2.json"
 
 
 def load_state(path: str) -> dict:
@@ -45,10 +60,14 @@ def save_state(path: str, state: dict) -> None:
 
 def format_alert(ticker: str, timestamp, signal: str, row: pd.Series) -> str:
     direction = "LONG" if "long" in signal else "SHORT"
+    stop = row.get("sweep_stop")
+    target = row.get("liquidity_target")
     return (
-        f"[ICT ENTRY] {ticker} {direction}\n"
+        f"[ICT v2 ENTRY] {ticker} {direction}\n"
         f"Time: {timestamp}\n"
         f"Close: {row['close']:.4f} | High: {row['high']:.4f} | Low: {row['low']:.4f}\n"
+        f"Raw sweep stop (buffer applied at execution): {stop:.4f}\n"
+        f"Liquidity-pool target: {target:.4f}\n"
         f"Signal: {signal}"
     )
 
@@ -139,8 +158,8 @@ def run_loop(tickers, args) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Live ICT liquidity-sweep alert bot")
-    parser.add_argument("--tickers", type=str, required=True, help="Comma-separated tickers, e.g. MES=F,MNQ=F")
+    parser = argparse.ArgumentParser(description="Live ICT liquidity-sweep alert bot v2 (24h, ES+NQ)")
+    parser.add_argument("--tickers", type=str, default="ES=F,NQ=F", help="Comma-separated tickers, default ES=F,NQ=F")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--interval-minutes", type=int, default=15)
     parser.add_argument("--state-file", type=str, default=STATE_FILE_DEFAULT)
@@ -150,16 +169,20 @@ if __name__ == "__main__":
     parser.add_argument("--telegram-chat-id", type=str, default=None)
     parser.add_argument("--discord-webhook", type=str, default=None)
 
-    # Strategy params (mirror ict_liquidity_strategy.py)
-    parser.add_argument("--liquidity-lookback", type=int, default=20)
-    parser.add_argument("--pivot-left", type=int, default=3)
-    parser.add_argument("--pivot-right", type=int, default=3)
-    parser.add_argument("--mss-window", type=int, default=15)
+    # Strategy params -- validated "Best Overall" NQ-family defaults from the study
+    parser.add_argument("--liquidity-lookback", type=int, default=30)
+    parser.add_argument("--pivot-left", type=int, default=2)
+    parser.add_argument("--pivot-right", type=int, default=2)
+    parser.add_argument("--mss-window", type=int, default=20)
     parser.add_argument("--retest-window", type=int, default=15)
+    parser.add_argument("--rr-target", type=float, default=2.5)
+    parser.add_argument("--exit-mode", type=str, default="liquidity", choices=["fixed_rr", "liquidity", "hybrid"])
+    parser.add_argument("--stop-buffer-atr", type=float, default=0.15)
+    parser.add_argument("--time-stop-bars", type=int, default=200)
 
-    # Session/killzone filter
-    parser.add_argument("--session-start", type=str, default=None, help='e.g. "02:00" for London killzone')
-    parser.add_argument("--session-end", type=str, default=None, help='e.g. "05:00" for London killzone')
+    # Session filter -- now OPT-IN, default is unrestricted 24h
+    parser.add_argument("--session-start", type=str, default=None, help='Optional, e.g. "02:00". Default: 24h')
+    parser.add_argument("--session-end", type=str, default=None, help='Optional, e.g. "05:00". Default: 24h')
     parser.add_argument("--session-timezone", type=str, default="America/New_York")
 
     args = parser.parse_args()
